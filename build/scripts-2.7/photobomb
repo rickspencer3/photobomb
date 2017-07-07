@@ -1,0 +1,1239 @@
+#!/usr/bin/python
+# -*- Mode: Python; coding: utf-8; indent-tabs-mode: nil; tab-width: 4 -*-
+### BEGIN LICENSE
+# Rick Spencer <rick.spencer@canonical.com>
+# This program is free software: you can redistribute it and/or modify it 
+# under the terms of the GNU General Public License version 3, as published 
+# by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it will be useful, but 
+# WITHOUT ANY WARRANTY; without even the implied warranties of 
+# MERCHANTABILITY, SATISFACTORY QUALITY, or FITNESS FOR A PARTICULAR 
+# PURPOSE.  See the GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along 
+# with this program.  If not, see <http://www.gnu.org/licenses/>.
+### END LICENSE
+
+import sys
+import os
+import gtk
+import pango
+from gwibber.lib.gtk import widgets
+import pickle
+
+# optional Launchpad integration
+# this shouldn't crash if not found as it is simply used for bug reporting
+try:
+    import LaunchpadIntegration
+    launchpad_available = True
+except:
+    launchpad_available = False
+
+import gobject
+import goocanvas
+import quickly.prompts
+from quickly.widgets.asynch_task_progressbox import AsynchTaskProgressBox
+from quickly.widgets.press_and_hold_button import PressAndHoldButton
+import cairo
+import pycurl
+import xml.dom.minidom
+import Image
+
+# Check if we are working in the source tree or from the installed 
+# package and mangle the python path accordingly
+if os.path.dirname(sys.argv[0]) != ".":
+    if sys.argv[0][0] == "/":
+        fullPath = os.path.dirname(sys.argv[0])
+    else:
+        fullPath = os.getcwd() + "/" + os.path.dirname(sys.argv[0])
+else:
+    fullPath = os.getcwd()
+sys.path.insert(0, os.path.dirname(fullPath))
+
+from photobomb import AboutPhotobombDialog, PreferencesPhotobombDialog, MicroblogDialog, SearchPage, DirectoryPage, CameraPage, ToolboxPage
+try:
+    from photobomb import GwibberPage
+except:
+    pass
+
+from photobomb.photobomb_item import PhotobombImage, PhotobombText, PhotobombPath
+from photobomb.photobombconfig import getdatapath
+
+class PhotobombWindow(gtk.Window):
+    __gtype_name__ = "PhotobombWindow"
+    selected_item = None
+    __imgur_api_key = "2c55bb870459a6678ae9a9d29d72ba2a"
+
+    __imgur_url = "http://imgur.com/api/upload.xml"
+    __temp_dir = os.path.join(os.environ["HOME"],".tmp","photobomb")
+
+    def __init__(self):
+        """__init__ - This function is typically not called directly.
+        Creation a PhotobombWindow requires redeading the associated ui
+        file and parsing the ui definition extrenally,
+        and then calling PhotobombWindow.finish_initializing().
+
+        Use the convenience function NewPhotobombWindow to create
+        PhotobombWindow object.
+
+        """
+        pass
+
+    def finish_initializing(self, builder):
+        """finish_initalizing should be called after parsing the ui definition
+        and creating a PhotobombWindow object with it in order to finish
+        initializing the start of the new PhotobombWindow instance.
+
+        """
+        #get a reference to the builder and set up the signals
+        self.builder = builder
+        self.builder.connect_signals(self)
+
+        global launchpad_available
+        if launchpad_available:
+            # see https://wiki.ubuntu.com/UbuntuDevelopment/Internationalisation/Coding for more information
+            # about LaunchpadIntegration
+            helpmenu = self.builder.get_object('menu3')
+            if helpmenu:
+                LaunchpadIntegration.set_sourcepackagename('photobomb')
+                LaunchpadIntegration.add_items(helpmenu, 0, False, True)
+            else:
+                launchpad_available = False
+
+        #uncomment the following code to read in preferences at start up
+        #dlg = PreferencesPhotobombDialog.NewPreferencesPhotobombDialog()
+        #self.preferences = dlg.get_preferences()
+        self.__ink_color = gtk.gdk.color_parse("#000")
+        self.__ink_width = 5
+        self.__font_name = "Ubuntu 10"
+    
+        #set up the goo canvas
+        self._canvas_width = 640
+        self._canvas_height = 480
+        self.__goo_canvas = goocanvas.Canvas()
+        self.__goo_canvas.set_size_request(self._canvas_width, self._canvas_height)
+        self.__goo_canvas.set_bounds(0,0,self._canvas_width,self._canvas_height)
+        self.__goo_canvas.show()
+        self.__root = self.__goo_canvas.get_root_item()
+        frame = gtk.Frame()
+        frame.set_shadow_type(gtk.SHADOW_IN)
+        frame.show()
+        frame.add(self.__goo_canvas)
+        self.builder.get_object("hbox2").pack_start(frame,False,False)
+        self.__goo_canvas.connect("button_press_event",self.mouse_down)
+        self.__selection_rect = None
+
+        self.__toggle_buttons = []
+        self.__toggle_handlers = {}
+        self.__initialize_object_buttons()
+
+        nb = self.builder.get_object("notebook1")
+
+        hbox = gtk.HBox(True)
+        hbox.set_border_width(5)
+        hbox.show()
+        img = gtk.image_new_from_icon_name("gnome-dev-harddisk", gtk.ICON_SIZE_LARGE_TOOLBAR)
+        img.show()
+        hbox.pack_start(img, False, False)
+        img.set_tooltip_text("Get photos on disks or connected devices")
+        self.__dir_box = DirectoryPage.DirectoryPage()
+        self.__dir_box.connect("clicked",self.add_image_from_pixbuf)
+        self.__dir_box.show()
+        nb.append_page(self.__dir_box, hbox)
+
+        hbox = gtk.HBox(True)
+        hbox.set_border_width(5)
+        hbox.show()
+        img = gtk.image_new_from_icon_name("web-browser", gtk.ICON_SIZE_LARGE_TOOLBAR)
+        img.show()
+        hbox.pack_start(img, False, False)
+        img.set_tooltip_text("Get photos from the web")
+        self.__web_box = SearchPage.SearchPage()
+        self.__web_box.connect("clicked",self.add_image_from_pixbuf)
+        self.__web_box.show()
+        nb.append_page(self.__web_box, hbox)
+
+        try:
+            hbox = gtk.HBox(True)   
+            hbox.set_border_width(5)
+            hbox.show()
+            img = gtk.image_new_from_icon_name("gwibber", gtk.ICON_SIZE_LARGE_TOOLBAR)
+            img.show()
+            hbox.pack_start(img, False, False)
+            img.set_tooltip_text("Get photos from feeds")
+            self.__gwib_box = GwibberPage.GwibberPage()
+            self.__gwib_box.connect("clicked",self.add_image_from_pixbuf)
+            self.__gwib_box.show()
+            nb.append_page(self.__gwib_box, hbox)
+        except Exception, inst:
+            print "Loading GwibberPage failed with exception:"
+            print inst
+
+        try:
+            hbox = gtk.HBox(True)
+            hbox.set_border_width(5)
+            hbox.show()
+            img = gtk.image_new_from_icon_name("camera-web", gtk.ICON_SIZE_LARGE_TOOLBAR)
+            img.show()
+            hbox.pack_start(img, False, False)
+            img.set_tooltip_text("Get photos from your web cam")
+            self.__cam_box = CameraPage.CameraPage()
+            self.__cam_box.connect("clicked",self.add_image_from_path)
+            self.__cam_box.show()
+            nb.append_page(self.__cam_box, hbox)
+        except Exception, inst:
+            print "Loading CameraPage failed with exception:"
+            print inst
+
+        self.__selected_tab = None
+
+        nb.connect("switch-page",self.images_tab_changed)
+        gobject.idle_add(self.__defered_start,nb)
+
+
+        #set up the undo/redo stack
+        self.undo_max = None
+        self.undos = []
+        self.redos = []
+
+        #track button release signals to workaround button release
+        #signal being called multiple times
+        self.__disconnected_tick_signals = []
+        self.z_order = []
+
+        #set up the clipboard
+        self.clipboard = gtk.Clipboard()
+        self.clipboard_item = None
+
+        #set up the drag destination
+        paste_data = [("UTF8_STRING", 0, 0),
+                    ("image/png", 0, 1),
+                    ("PhotobombItem", 0, 2),
+                    ("image/jpg", 0, 1),
+                    ("image/jpeg", 0, 1),
+                    ("image/gif", 0, 1),]
+        self.__goo_canvas.drag_dest_set(gtk.DEST_DEFAULT_HIGHLIGHT | gtk.DEST_DEFAULT_DROP,
+                                         paste_data, 0)
+        self.__goo_canvas.connect('drag_motion', self.drag_motion)
+        self.__goo_canvas.connect('drag_drop', self.drop_handler)
+   
+    def drag_motion(self, wid, context, x, y, time):
+        context.drag_status(gtk.gdk.ACTION_COPY, time)
+        return True
+
+    def drop_handler(self, wid, context, x, y, time):
+        for t in targets:
+            print t
+        self._process_paste_targets(context.targets)
+        context.finish(True, False, time)
+        return True
+
+    def __defered_start(self, notebook):
+        index = notebook.get_current_page()
+        notebook.get_nth_page(index).on_selected()
+        return False
+
+    def __initialize_object_buttons(self):
+        accel_group = gtk.AccelGroup()
+        self.add_accel_group(accel_group)        
+
+        #toolbar 1, section 1
+        ab = self.__create_toggle_button("arrow.svg", "Select items", None)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(ab)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+
+        sep = gtk.SeparatorToolItem()
+        sep.show()
+        self.builder.get_object("toolbar1").insert(sep,-1)
+
+        #toolbar 1, section 2
+        display = self.get_screen().get_display()
+        image_path = getdatapath() + "/media/" + "pen.svg"
+        pixbuf = gtk.gdk.pixbuf_new_from_file(image_path)
+
+        curs = gtk.gdk.Cursor(display, pixbuf, 5, 38)
+
+        self.__pen_but = self.__create_toggle_button("pen.svg", "Ink", curs)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(self.__pen_but)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+
+        but = self.__create_stock_button(gtk.STOCK_EDIT, "Type", self.type_)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar1").insert(pi,-1)        
+
+        sep = gtk.SeparatorToolItem()
+        sep.show()
+        self.builder.get_object("toolbar1").insert(sep,-1)
+
+        #toolbar 1, section 3
+        image_path = getdatapath() + "/media/" + "knife.svg"
+        pixbuf = gtk.gdk.pixbuf_new_from_file(image_path)
+
+        curs = gtk.gdk.Cursor(display, pixbuf, 21, 42)
+
+        self.__knife_but = self.__create_toggle_button("knife.svg", "Clipping tool", 
+                                                        curs)
+        ki = gtk.ToolItem()
+        ki.show()
+        ki.add(self.__knife_but)
+        self.builder.get_object("toolbar1").insert(ki,-1)
+
+        del_but = self.__create_image_button("delete.svg", "Delete", self.delete_selected)
+        del_but.add_accelerator("clicked",accel_group,gtk.keysyms.Delete, 0, gtk.ACCEL_VISIBLE)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(del_but)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+
+        but = self.__create_stock_button(gtk.STOCK_PASTE, "Duplicate Selected", self.duplicate)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+
+        sep = gtk.SeparatorToolItem()
+        sep.show()
+        self.builder.get_object("toolbar1").insert(sep,-1)
+
+        #toolbar 1, section 4
+        self.__color_but = self.__create_stock_button(gtk.STOCK_SELECT_COLOR,"Choose ink color", self.ink_color)
+        self.__color_but.modify_bg(gtk.STATE_NORMAL, self.__ink_color)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(self.__color_but)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+
+        vb = gtk.VBox(0,False)
+        vb.show()
+        hb = gtk.HBox(0,False)
+        hb.show()
+        lbl = gtk.Label("Font")
+        lbl.set_alignment(.5,1)
+        lbl.show()
+        hb.pack_start(lbl, True, False)
+        vb.pack_start(hb,True, True)
+
+        but = gtk.Button()
+        but.show()
+        self._font_label = gtk.Label("ABCDE, ...")
+        self._font_label.show()
+        self._font_label.modify_font(pango.FontDescription(self.__font_name))
+        but.add(self._font_label)
+        
+        vb.pack_end(but, False, False)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(vb)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+        but.connect("clicked",self.select_font)
+
+        vb = gtk.VBox(0,False)
+        vb.show()
+        hb = gtk.HBox(0,False)
+        hb.show()
+        lbl = gtk.Label("Opacity")
+        lbl.set_alignment(.5,1)
+        lbl.show()
+        hb.pack_start(lbl, True, False)
+        vb.pack_start(hb,True, True)
+
+        self._opacity_slider = gtk.HScale()
+        self._opacity_slider.set_draw_value(False)
+        self._opacity_slider.set_increments(1,2)
+        self._opacity_slider.set_restrict_to_fill_level(False)
+        self._opacity_slider.set_range(1, 10)
+        self._opacity_slider.set_size_request(100,-1)
+        self._opacity_slider.show()
+
+        vb.pack_end(self._opacity_slider, False, False)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(vb)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+        self._opacity_signal_id = self._opacity_slider.connect("value-changed",self.set_object_opacity)
+
+        vb = gtk.VBox(0,False)
+        vb.show()
+        hb = gtk.HBox(0,False)
+        hb.show()
+        lbl = gtk.Label("Line Thickness")
+        lbl.set_alignment(.5,1)
+        lbl.show()
+        hb.pack_start(lbl, True, False)
+        vb.pack_start(hb,True, True)
+
+        self._line_slider = gtk.HScale()
+        self._line_slider.set_draw_value(False)
+        self._line_slider.set_increments(10,20)
+        self._line_slider.set_restrict_to_fill_level(False)
+        self._line_slider.set_range(1, 50)
+        self._line_slider.set_size_request(100,-1)
+        self._line_slider.show()
+
+        vb.pack_end(self._line_slider, False, False)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(vb)
+        self.builder.get_object("toolbar1").insert(pi,-1)
+        self._line_signal_id = self._line_slider.connect("value-changed",self.ink_width)
+
+        #toolbar2
+        big_but = self.__create_press_button("bigger.svg", "Make bigger", self.bigger)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(big_but)
+        self.builder.get_object("toolbar2").insert(pi,-1)
+
+        sm_but = self.__create_press_button("smaller.svg", "Make smaller", self.smaller)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(sm_but)
+        self.builder.get_object("toolbar2").insert(pi,-1)
+
+        but = self.__create_press_button("rotate_counter.svg", "Rotate counter-clockwise", self.counter_clockwise)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar2").insert(pi,-1)
+
+        but = self.__create_press_button("rotate_clock.svg", "Rotate clockwise", self.clockwise)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar2").insert(pi,-1)
+
+        but = self.__create_image_button("top.svg", "Bring to top", self.top)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar2").insert(pi,-1)
+
+        but = self.__create_image_button("bottom.svg", "Send to bottom", self.bottom)
+        pi = gtk.ToolItem()
+        pi.show()
+        pi.add(but)
+        self.builder.get_object("toolbar2").insert(pi,-1)        
+        return
+           
+    def __create_toggle_button(self, icon, tooltip, cursor):
+        button = gtk.ToggleButton()
+        image_path = getdatapath() + "/media/" + icon
+        img = gtk.Image()
+        img.set_from_file(image_path)
+        button.set_image(img)
+        button.set_tooltip_text(tooltip)
+
+        button.connect("toggled",self.toggled, cursor)
+        button.show()
+        self.__toggle_buttons.append(button)
+        h = button.connect("toggled",self.toggle_toggles)
+        self.__toggle_handlers[button] = h
+        return button
+
+    def toggle_toggles(self, widget, data=None):
+        for t in self.__toggle_buttons:
+            t.disconnect(self.__toggle_handlers[t])
+            if t is not widget:
+                t.set_active(False)
+
+        self.__toggle_handlers = {}
+        for t in self.__toggle_buttons:
+            h = t.connect("toggled",self.toggle_toggles)
+            self.__toggle_handlers[t] = h
+
+    def toggled(self, widget, cursor):
+        if widget.get_active():
+            if cursor:
+                self.__goo_canvas.window.set_cursor(cursor)
+            else:
+                self.__goo_canvas.window.set_cursor(None)
+        active_toggle = False
+        for t in self.__toggle_buttons:
+            if t.get_active():
+                active_toggle = True
+        if not active_toggle:
+            self.__goo_canvas.window.set_cursor(None)
+
+    def __create_stock_button(self, icon, tooltip, action):
+        button = gtk.Button()
+        img = gtk.image_new_from_stock(icon,  gtk.ICON_SIZE_BUTTON)
+        button.set_image(img)
+        button. set_tooltip_text(tooltip)
+        button.connect("clicked",action)
+        button.connect("activate",action)
+        button.show()
+        return button
+
+    def __create_image_button(self, icon, tooltip, action):
+        button = gtk.Button()
+        image_path = getdatapath() + "/media/" + icon
+        img = gtk.Image()
+        img.set_from_file(image_path)
+        button.set_image(img)
+        button.set_tooltip_text(tooltip)
+        button.connect("clicked",action)
+        button.connect("activate",action)
+        button.show()
+        return button
+                
+    def __create_press_button(self, icon, tooltip, action):
+        button = PressAndHoldButton()
+        button.timeout = 50
+        button.connect("pressed",self.pah_button_pressed, action)
+        image_path = getdatapath() + "/media/" + icon
+        img = gtk.Image()
+        img.set_from_file(image_path)
+        button.set_image(img)
+        button.set_tooltip_text(tooltip)
+        button.show()
+        return button
+
+    def mouse_down(self, widget, event):
+        if self.__pen_but.get_active():
+            self.__draw_points = []
+            self.__motion_handler = self.__goo_canvas.connect("motion_notify_event",self.draw)
+            self.__mouse_up_handler = self.__goo_canvas.connect("button_release_event",self.draw_stop)
+            
+        elif self.__knife_but.get_active():
+            clicked_item = self.__goo_canvas.get_item_at(event.x,event.y, True)
+            if clicked_item is not None:
+                self.__motion_handler = self.__goo_canvas.connect("motion_notify_event",self.clip)
+                self.__mouse_up_handler = self.__goo_canvas.connect("button_release_event",self.clip_stop)
+                self.__draw_points = []
+                self.__clip_points = []
+                if clicked_item is not self.__selection_rect:
+                    self.selected_item = clicked_item
+                    self.__reset_selection()
+                    
+        else:
+            clicked_item = self.__goo_canvas.get_item_at(event.x,event.y, True)
+            if clicked_item is not self.__selection_rect:
+                if clicked_item is None:
+                    self.selected_item = None
+                else:
+                    old_item = self.back_up_item(clicked_item)
+                    self.selected_item = clicked_item
+        
+                    self.__old_x = event.x
+                    self.__old_y = event.y
+                    self.__motion_handler = self.__goo_canvas.connect("motion_notify_event",self.item_moved)
+                    self.__mouse_up_handler = self.__goo_canvas.connect("button_release_event",self.drag_stop, old_item)
+                    self.__goo_canvas.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.HAND1))
+                self.__reset_selection()
+
+    def __reset_selection(self):
+        if self.__selection_rect is not None:
+            self.__selection_rect.remove()
+        if self.selected_item is None:
+            return
+
+        item = self.selected_item
+        item_bounds = item.get_bounds()
+        item_left = item_bounds.x1
+        item_top = item_bounds.y1
+
+        pad, pad2 = self.__goo_canvas.convert_to_item_space(self.selected_item,
+                                                        10, 10)
+
+        selection_width = (item_bounds.x2 - item_bounds.x1) + 20
+        selection_height = (item_bounds.y2 - item_bounds.y1) + 20
+        self.__selection_rect = goocanvas.Rect( parent=self.__root, 
+                                                x=item_bounds.x1 - 10, 
+                                                y=item_bounds.y1 - 10,
+                                                width=selection_width,
+                                                height=selection_height,
+                                                fill_color='#D0C7C7',
+                                                stroke_color='#D0C7C7',
+                                                radius_x=10,
+                                                radius_y=10)
+
+        color = gdk_to_rgba(gtk.gdk.color_parse('#D0C7C7'),27000)
+        self.__selection_rect.set_property("fill_color_rgba" , color)
+        self.__selection_rect.set_property("stroke_color_rgba" , color)
+        self.__selection_rect.lower(self.selected_item)
+        self._opacity_slider.disconnect(self._opacity_signal_id)
+        self._opacity_slider.set_value(self.selected_item.opacity_percentage/10)
+        self._opacity_signal_id = self._opacity_slider.connect("value-changed",self.set_object_opacity)
+        
+
+        self._line_slider.disconnect(self._line_signal_id)
+
+        if self.selected_item.line_width is None:
+            self._line_slider.set_value(0.0)
+            self._line_slider.set_sensitive(False)
+        else:
+            self._line_slider.set_value(self.selected_item.line_width)
+            self._line_slider.set_sensitive(True)
+
+        self._line_signal_id = self._line_slider.connect("value-changed",self.ink_width)
+        self.set_sensitive_ui()
+
+    def draw(self, widget, event):
+        self.__draw_points.append((event.x,event.y))
+        if len(self.__draw_points) == 2:
+            self.__path_data = "M " + str(self.__draw_points[0][0]) + " " + str(self.__draw_points[0][1])
+            self.__path_data += "C" + str(self.__draw_points[1][0]) + " " + str(self.__draw_points[1][1])
+            self.__draw_path = PhotobombPath(self.__goo_canvas, self.__path_data, 
+                                             self.__ink_width, self.__ink_color)
+ 
+            self.selected_item = self.__draw_path
+            if self.__selection_rect is not None:
+                self.__selection_rect.remove()
+
+        if len(self.__draw_points) > 2:
+            #self.__path_data += " " + str(event.x) + " " + str(event.y)
+            #TODO: Find a way to append the data without resetting
+            #the whole property ... this is too slow
+            #makes ink lag when it gets long
+            #self.__draw_path.data = self.__path_data
+            self.__draw_path.append(event.x,event.y)
+
+    def clip(self, widget, event):
+        e_x, e_y = self.__goo_canvas.convert_to_item_space(self.selected_item,event.x,event.y)
+        self.__draw_points.append((event.x,event.y))
+        self.__clip_points.append((e_x, e_y))
+
+        if len(self.__draw_points) == 2:
+            self.__path_data = "M " + str(self.__draw_points[0][0]) + " " + str(self.__draw_points[0][1])
+            self.__path_data += "C" + str(self.__draw_points[1][0]) + " " + str(self.__draw_points[1][1])
+
+            self.__clip_data = "M " + str(self.__clip_points[0][0]) + " " + str(self.__clip_points[0][1])
+            self.__clip_data += "C" + str(self.__clip_points[1][0]) + " " + str(self.__clip_points[1][1])
+
+            self.__draw_path = goocanvas.Path(data=self.__path_data, 
+                                            parent=self.__root, line_width=1,
+                                            stroke_color="red")
+
+        if len(self.__draw_points) > 2:
+            self.__path_data += " " + str(event.x) + " " + str(event.y)
+            self.__clip_data += " " + str(e_x) + " " + str(e_y)
+            self.__draw_path.set_property("data",self.__path_data)
+
+    def cut_menu(self, widget, data=None):
+        if self.selected_item is not None:
+            self.copy_menu(widget)
+            self.delete_selected(widget)
+        self.set_sensitive_ui()
+
+    def copy_menu(self, widget, data=None):
+        paste_data = [("UTF8_STRING", 0, 0),
+                    ("image/png", 0, 1),
+                    ("PhotobombItem", 0, 2)]
+
+        self.clipboard.set_with_data(paste_data, self.format_for_clipboard, self.clipboard_cleared)
+        self.clipboard_item = self.selected_item
+        self.set_sensitive_ui()
+
+    def paste_menu(self, widget, data=None):
+        targets = self.clipboard.wait_for_targets()
+        self._process_paste_targets(targets)
+        self.set_sensitive_ui()
+
+    def _process_paste_targets(self, targets):
+        if "PhotobombItem" in targets:
+            self.clipboard.request_contents("PhotobombItem", self.paste_photobomb_item)
+            return
+        for t in targets:
+            if t.lower().find("image") > -1:
+                self.clipboard.request_image(self.paste_image)
+                return
+        for t in targets:
+            if t.lower().find("string") > -1 or t.lower().find("text") > -1:
+                self.clipboard.request_text(self.paste_text)
+                return
+
+    def paste_text(self, clipboard, text, data=None):
+        self.add_new_text(text)
+
+    def paste_image(self, clipboard, pixbuf, data=None):
+        self.add_image_from_pixbuf(self, pixbuf)
+
+    def paste_photobomb_item(self, clipboard, selectiondata, data=None):
+            #TODO: include opacity
+            item_dict = pickle.loads(clipboard.wait_for_text())
+            if item_dict["type"] is PhotobombPath:
+                new_item = PhotobombPath(self.__goo_canvas,
+                                         item_dict["path"],
+                                         item_dict["width"], None)
+                new_item.set_property("stroke_color_rgba",item_dict["stroke-color"])
+            elif item_dict["type"] is PhotobombText:
+                new_item = PhotobombText(self.__goo_canvas,
+                                        item_dict["text"], None)
+                new_item.set_property("fill_color_rgba",item_dict["fill-color"])
+                new_item.font = item_dict["font"]
+            elif item_dict["type"] is PhotobombImage:
+                pixbuf = gtk.gdk.pixbuf_new_from_data(*item_dict["pixbuf_args"])
+                new_item = PhotobombImage(self.__goo_canvas,pixbuf)
+
+            t = item_dict["transform"]
+            if t is not None:
+                trans = cairo.Matrix(t[0],t[1], t[2], t[3], t[4], t[5]) 
+                new_item.set_transform(trans)
+            new_item.opacity_percentage = item_dict["opacity"]
+            new_item.set_clip_path(item_dict["clip"])
+            new_item.translate(10,10)
+            new_item.set_property("parent", self.__root)
+            self.z_order.append(new_item)
+            self.add_undo(new_item, None)
+
+            self.selected_item = new_item
+            self.__reset_selection()
+
+    def format_for_clipboard(self, clipboard, selectiondata, info, data=None):
+        if selectiondata.get_target() == "UTF8_STRING":
+            self.clipboard.set_text(self.clipboard_item.text)
+        if selectiondata.get_target() == "image/png":
+            selectiondata.set("image/png", 8, self.image_for_item(self.clipboard_item))
+        if selectiondata.get_target() == "PhotobombItem":
+            d = {"type":type(self.clipboard_item)}
+            t = self.clipboard_item.get_transform()
+            if t is None:
+                trans = None
+            else:
+                trans =(t[0],t[1],t[2],t[3],t[4],t[5])
+            d["transform"] = trans
+            d["clip"] = self.clipboard_item._clip_path
+            d["stroke-color"] = self.clipboard_item.get_property("stroke_color_rgba")
+            d["fill-color"] = self.clipboard_item.get_property("fill_color_rgba")
+            d["text"] = self.clipboard_item.text
+            d["font"] = self.clipboard_item.font
+            d["opacity"] = self.clipboard_item.opacity_percentage
+            d["width"] = self.clipboard_item.line_width
+            if type(self.clipboard_item) is PhotobombPath:
+                d["path"] = self.clipboard_item.data
+            if type(self.clipboard_item) is PhotobombImage:
+                d["pixbuf_args"] = (self.clipboard_item.pixbuf.get_pixels(), 
+                                    self.clipboard_item.pixbuf.get_colorspace(),
+                                    self.clipboard_item.pixbuf.get_has_alpha(),
+                                    self.clipboard_item.pixbuf. get_bits_per_sample(),
+                                    self.clipboard_item.pixbuf.get_width(),
+                                    self.clipboard_item.pixbuf.get_height(),
+                                    self.clipboard_item.pixbuf.get_rowstride())
+                
+            s = pickle.dumps(d)
+            self.clipboard.set_text(s)
+
+    def clipboard_cleared(self, clipboard, data=None):
+        pass
+
+    def nudge(self, delta_x, delta_y):
+        if self.selected_item is not None:
+            saved_item = self.back_up_item()
+            self.selected_item.move(delta_x,delta_y)
+            self.__reset_selection()
+            self.add_undo(self.selected_item, saved_item)
+
+    def left(self, widget, data=None):
+        self.nudge(-10,0)
+                
+    def right(self, widget, data=None):
+        self.nudge(10,0)
+
+    def up(self, widget, data=None):
+        self.nudge(0,-10)
+
+    def down(self, widget, data=None):
+        self.nudge(0,10)
+
+    def duplicate(self, widget, data=None):
+        self.selected_item = self.selected_item.duplicate(True, True)
+        self.z_order.append(self.selected_item)
+        self.__reset_selection()
+        self.add_undo(self.selected_item, None)
+        
+    def type_(self, widget, data=None):
+        val = ""
+        saved_item = None
+        if self.selected_item is not None:
+            val = self.selected_item.text
+
+        response, val = quickly.prompts.string("Photobomb Add Text", "Enter text", val)
+        if response == gtk.RESPONSE_OK:
+            if self.selected_item is not None and type(self.selected_item) == PhotobombText:
+                saved_item = self.back_up_item()
+                self.selected_item.text = val
+                self.__reset_selection()
+                self.add_undo(self.selected_item, saved_item)
+            else:
+                self.add_new_text(val)
+            
+        
+    def add_new_text(self, text):
+        txt = PhotobombText(self.__goo_canvas, text, self.__ink_color)
+        if self.__font_name is not None:
+            txt.font = self.__font_name
+        self.selected_item = txt
+        self.z_order.append(self.selected_item)
+        self.__reset_selection()
+        self.add_undo(self.selected_item, None)
+
+    def select_font(self, widget, data=None):
+        dialog = gtk.FontSelectionDialog("Font")
+
+        #hide the widgets for setting font size
+        t = dialog.fontsel.get_size_entry().get_parent()
+        t.get_children()[0].hide()
+        t.get_children()[3].hide()
+        t.get_children()[6].hide()
+
+        if self.__font_name is not None:
+            dialog.set_font_name(self.__font_name)
+        
+        response = dialog.run()
+        if response == gtk.RESPONSE_OK:
+            self.__font_name = dialog.get_font_name()
+            self._font_label.modify_font(pango.FontDescription(self.__font_name))
+        dialog.destroy()
+        if self.selected_item is not None:
+            saved_item = self.back_up_item()
+            self.selected_item.set_property("font",self.__font_name)            
+            self.__reset_selection()
+            self.add_undo(self.selected_item, saved_item)
+
+    def item_moved(self, widget, event):
+        if self.selected_item is None:
+            return
+        e_x, e_y = self.__goo_canvas.convert_to_item_space(self.selected_item,event.x,event.y)
+        o_x, o_y = self.__goo_canvas.convert_to_item_space(self.selected_item,self.__old_x, self.__old_y)
+
+        self.selected_item.translate(e_x - o_x, e_y - o_y)
+        self.__old_x = event.x
+        self.__old_y = event.y
+        self.__reset_selection()
+        
+    def draw_stop(self, widget, event):
+        self.__goo_canvas.disconnect(self.__motion_handler)
+        self.__goo_canvas.disconnect(self.__mouse_up_handler)
+        self.__reset_selection()
+        self.z_order.append(self.selected_item)
+        self.add_undo(self.selected_item, None)
+
+    def clip_stop(self, widget, event):
+        saved_item = self.back_up_item()
+        self.selected_item.set_clip_path(self.__clip_data)
+        self.__draw_path.remove()
+        self.__knife_but.set_active(False)
+        self.__goo_canvas.disconnect(self.__motion_handler)
+        self.__goo_canvas.disconnect(self.__mouse_up_handler)
+        self.__goo_canvas.window.set_cursor(None)
+        self.__reset_selection()
+        self.add_undo(self.selected_item, saved_item)
+
+    def drag_stop(self, widget, event, old_item):
+        self.__goo_canvas.disconnect(self.__motion_handler)
+        self.__goo_canvas.disconnect(self.__mouse_up_handler)
+        self.__goo_canvas.window.set_cursor(None)
+        if self.selected_item is not None:
+            #if the item has actually moved, store the undo
+            old_bounds = old_item.get_bounds()
+            new_bounds = self.selected_item.get_bounds()
+            if int(old_bounds.x1) != int(new_bounds.x1) or int(old_bounds.y1) != int(new_bounds.y1):
+                self.add_undo(self.selected_item,old_item)
+
+    def delete_selected(self, widget, data=None):
+        if self.selected_item is not None:
+            self.add_undo(None,self.selected_item)
+            self.selected_item.remove()
+            self.selected_item = None
+            self.__reset_selection()
+
+    def add_undo(self, new_item, old_item):
+        #ensure proper undos for multiple edits of the same object
+        if len(self.undos) > 0:
+            for item in self.undos[::-1]:
+                if item["new_item"] is new_item:
+                    item["new_item"] = old_item
+                    break
+
+        self.undos.append({"new_item":new_item,
+                                "old_item":old_item})
+        self.redos = []
+        self.set_sensitive_ui()
+
+    def _find_item_above(self, item):
+        if self.z_order[-1] is item:
+            return None
+        else:
+            index = self.z_order.index(item)
+            next_item = None
+            for i in xrange(index + 1, len(self.z_order)):
+                if self.z_order[i].get_property("parent") is not None:
+                    return self.z_order[i]
+
+    def undo(self, widget=None, data=None):
+        if len(self.undos) < 1:
+            return 
+
+        undo = self.undos[-1]
+        self.redos.append(undo)
+        del(self.undos[-1])
+
+        if undo["new_item"] is not None:
+            undo["new_item"].remove()
+        if undo["old_item"] is not None:
+            undo["old_item"].set_property("parent",self.__root)
+            next_item = self._find_item_above(undo["old_item"])
+            if next_item is not None:
+                undo["old_item"].lower(next_item)
+
+        self.selected_item = undo["old_item"]
+        self.__reset_selection()
+        self.set_sensitive_ui()
+
+    def redo(self, widget=None, data=None):
+        if len(self.redos) <1:
+            return
+
+        redo = self.redos[-1]
+        self.undos.append(redo)
+        del(self.redos[-1])
+
+        if redo["old_item"] is not None:
+            redo["old_item"].remove()
+        if redo["new_item"] is not None:
+            redo["new_item"].set_property("parent",self.__root)
+            next_item = self._find_item_above(redo["new_item"])
+            if next_item is not None:
+                redo["new_item"].lower(next_item)
+
+        self.selected_item = redo["new_item"]
+        self.__reset_selection()
+        self.set_sensitive_ui()
+
+    def import_(self, widget, data=None):
+        result, val = quickly.prompts.open_image_file()
+        if result == gtk.RESPONSE_OK:
+            self.add_image_from_path(val, val)
+
+    def add_image_from_path(self, widget, path):
+        pb = gtk.gdk.pixbuf_new_from_file(path)
+        self.add_image_from_pixbuf(widget, pb)
+        
+    def add_image_from_pixbuf(self,widget, pb):        
+        img = PhotobombImage(self.__goo_canvas, pb)
+        self.selected_item = img
+        self.__reset_selection()
+        self.z_order.append(self.selected_item)
+        self.add_undo(self.selected_item, None)
+
+    def top(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.z_order.remove(self.selected_item)
+            self.z_order.append(self.selected_item)
+            self.selected_item.bring_to_top()
+            self.add_undo(self.selected_item, old_item)
+        self.__reset_selection()
+
+    def bottom(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.z_order.remove(self.selected_item)
+            self.z_order.insert(0, self.selected_item)
+            self.selected_item.send_to_bottom()
+            self.add_undo(self.selected_item, old_item)
+        self.__reset_selection()
+
+    def back_up_item(self, item=None):
+        if item is None:
+            item = self.selected_item
+        copy = item.duplicate(True, False)
+        copy.remove()
+        index = self.z_order.index(item)
+        self.z_order.insert(index+1,copy)    
+        return copy
+
+    def pah_button_pressed(self, button, action):
+        old_item = self.back_up_item()
+        tick_signal_id = button.connect("tick",action)
+        button.connect("released",self.pah_button_released, (tick_signal_id, old_item))
+
+    def pah_button_released(self, button, args):
+        tick_signal_id, old_item = args
+        #work around released signals being called multiple times
+        if tick_signal_id in self.__disconnected_tick_signals:
+            return
+        self.__disconnected_tick_signals.append(tick_signal_id)
+
+        button.disconnect(tick_signal_id)
+        if self.selected_item is not None:
+            self.add_undo(self.selected_item, old_item)
+            
+    def clockwise_menu(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.clockwise()        
+            self.add_undo(self.selected_item, old_item)
+
+    def clockwise(self, widget=None, data=None):
+        if self.selected_item is not None:
+            self.selected_item.rotate(5)
+            self.__reset_selection()
+
+    def counter_clockwise_menu(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.counter_clockwise()        
+            self.add_undo(self.selected_item, old_item)
+
+    def counter_clockwise(self, widget=None, data=None):
+        if self.selected_item is not None:
+            self.selected_item.rotate(-5)
+            self.__reset_selection()
+
+    def set_object_opacity(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.selected_item.opacity_percentage = widget.get_value() * 10
+            self.add_undo(self.selected_item, old_item)
+
+    def less_opac(self, widget=None, data=None):
+        if self.selected_item is not None:
+            saved_item = self.back_up_item()
+
+            self.selected_item.decrease_opacity()
+            self._opacity_slider.set_value(self.selected_item.opacity_percentage)
+
+            self.add_undo(self.selected_item, saved_item)
+
+    def more_opac(self, widget=None, data=None):
+        if self.selected_item is not None:
+            saved_item = self.back_up_item()
+
+            self.selected_item.increase_opacity()
+            self._opacity_slider.set_value(self.selected_item.opacity_percentage)
+
+            self.add_undo(self.selected_item, saved_item)
+
+    def bigger_menu(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.bigger()        
+            self.add_undo(self.selected_item, old_item)
+
+    def bigger(self, widget=None, data=None):
+        if self.selected_item is not None:
+            self.selected_item.grow()
+            self.__reset_selection()
+            bounds = self.selected_item.get_bounds()
+
+    def smaller_menu(self, widget, data=None):
+        if self.selected_item is not None:
+            old_item = self.back_up_item()
+            self.smaller()        
+            self.add_undo(self.selected_item, old_item)
+                        
+    def smaller(self, widget=None, data=None):
+        if self.selected_item is not None:
+            self.selected_item.shrink()
+            self.__reset_selection()
+
+    def about(self, widget, data=None):
+        """about - display the about box for photobomb """
+        about = AboutPhotobombDialog.NewAboutPhotobombDialog()
+        response = about.run()
+        about.destroy()
+
+    def export(self, widget, data=None):
+        response, fn = quickly.prompts.save_image_file("Save Photobomb")
+        if response != gtk.RESPONSE_OK:
+            return
+        else:
+            self.__create_image(fn)
+
+    def __create_image(self, image_path):
+        if self.__selection_rect is not None:
+            self.__selection_rect.remove()
+
+        x, y, w, h = self.__goo_canvas.get_bounds()
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(w), int(h))
+        context = cairo.Context(surface)
+        context.rectangle(0, 0, self._canvas_width, self._canvas_height)
+        context.set_source_rgb(1, 1, 1)
+        context.fill()
+        self.__goo_canvas.render(context)
+        surface.write_to_png(image_path)
+
+    def image_for_item(self, item):
+        #create a new GooCanvas with just the selected item
+        item = item.duplicate(True, False)
+        item.remove()
+
+        #make the canvas the same size as the item
+        bounds = item.get_bounds()
+        w = bounds.x2 - bounds.x1
+        h = bounds.y2 - bounds.y1
+        temp_canvas = goocanvas.Canvas()
+        temp_canvas.set_bounds(0,0,w,h)
+        item.set_property("parent",temp_canvas.get_root_item())
+
+        #move the item to top left of the new canvas
+        x1, y1 = temp_canvas.convert_to_item_space(item, 0, 0)
+        x2, y2 = temp_canvas.convert_to_item_space(item, bounds.x1, bounds.y1)
+        dx, dy = temp_canvas.convert_to_item_space(item, x2, y2)
+        item.translate(x1-x2, y1-y2)
+
+        #create a cairo context with the goocanvas
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(w), int(h))
+        context = cairo.Context(surface)
+        context.rectangle(0, 0, w, h)
+        context.set_source_rgb(1, 1, 1)
+        context.fill()
+
+        #create a file and return the stream
+        if not os.path.exists(self.__temp_dir):
+            os.makedirs(self.__temp_dir)
+        temp_file = os.path.join(self.__temp_dir,"temp.png")
+
+        temp_canvas.render(context)
+        surface.write_to_png(temp_file)
+        return open(temp_file,'r').read()
+    
+    def micro_blog(self, widget, data=None):
+        if not os.path.exists(self.__temp_dir):
+            os.makedirs(self.__temp_dir)
+        temp_file = os.path.join(self.__temp_dir,"temp.png")
+        self.__create_image(temp_file)
+
+        c = pycurl.Curl()
+        values = [("key", self.__imgur_api_key),("image",(c.FORM_FILE,temp_file))]
+        c.setopt(c.URL, self.__imgur_url)
+        c.setopt(c.HTTPPOST, values)
+        c.setopt(pycurl.WRITEFUNCTION, self.__handle_imgur_response)
+
+        try:
+            c.perform()
+            c.close()
+        except:
+            quickly.prompts.error("Photobomb Web Error","Couldn't connect to the web.")
+
+    def __handle_imgur_response(self, data):
+        try:
+            doc = xml.dom.minidom.parseString(data)
+            img_url = doc.getElementsByTagName("original_image")
+            img_url = img_url[0].childNodes[0].data
+            gwib_win = MicroblogDialog.MicroblogDialog(img_url, self)
+            response = gwib_win.show()
+
+        except Exception, inst:
+            quickly.prompts.error("Photobomb Error","Image upload failed\n\n" + str(inst))
+    
+    def ink_color(self, widget, data=None):
+        dialog = gtk.ColorSelectionDialog("Ink Color")
+        dialog.get_color_selection().set_current_color(self.__ink_color)
+        response = dialog.run()
+        if response == gtk.RESPONSE_OK:
+            self.__ink_color = dialog.get_color_selection().get_current_color()
+            self.__color_but.modify_bg(gtk.STATE_NORMAL,self.__ink_color)
+            if self.selected_item is not None:
+                saved_item = self.back_up_item()
+                self.selected_item.color = self.__ink_color
+                self.add_undo(self.selected_item, saved_item)
+        dialog.destroy()
+
+    def ink_width(self, widget, data=None):
+        if self.selected_item is not None:
+            saved_item = self.back_up_item()
+            self.selected_item.line_width = widget.get_value()
+            self.add_undo(self.selected_item, saved_item)
+
+    def preferences(self, widget, data=None):
+        """preferences - display the preferences window for photobomb """
+        prefs = PreferencesPhotobombDialog.NewPreferencesPhotobombDialog()
+        response = prefs.run()
+        if response == gtk.RESPONSE_OK:
+            #make any updates based on changed preferences here
+            pass
+        prefs.destroy()
+
+    def images_tab_changed(self, notebook, page, page_num, data=None):
+        if self.__selected_tab is not None:
+            self.__selected_tab.on_deselected()
+        self.__selected_tab = notebook.get_nth_page(page_num)
+        self.__selected_tab.on_selected()
+
+    def set_sensitive_ui(self, widget=None, data=None):
+        active_undos = len(self.undos) > 0
+        active_redos = len(self.redos) > 0
+        self.builder.get_object("menuitem_undo").set_sensitive(active_undos)
+        self.builder.get_object("menuitem_redo").set_sensitive(active_redos)
+
+        item_selected = self.selected_item is not None
+        self.builder.get_object("menuitem_cut").set_sensitive(item_selected)
+        self.builder.get_object("menuitem_copy").set_sensitive(item_selected)
+
+##TODO: see if I can make this work by using threads_enter, threads_leave
+#        paste_available = False
+      
+#        if self.clipboard.wait_is_text_available():
+#            paste_available = True
+#        elif self.clipboard.wait_is_target_available("PhotobombItem"):
+#            paste_available = True
+#        elif self.clipboard.wait_is_image_available():
+#            paste_available = True
+#        self.builder.get_object("menuitem_paste").set_sensitive(paste_available)
+
+    def quit(self, widget, data=None):
+        """quit - signal handler for closing the PhotobombWindow"""
+        self.destroy()
+
+    def on_destroy(self, widget, data=None):
+        """on_destroy - called when the PhotobombWindow is close. """
+        #clean up code for saving application state should be added here
+        paste_data = [("UTF8_STRING", 0, 0),
+                    ("image/png", 0, 1),
+                    ("PhotobombItem", 0, 2)]
+        self.clipboard.set_can_store(paste_data)
+        self.clipboard.store()
+
+        gtk.main_quit()
+
+def NewPhotobombWindow():
+    """NewPhotobombWindow - returns a fully instantiated
+    PhotobombWindow object. Use this function rather than
+    creating a PhotobombWindow directly.
+    """
+
+    #look for the ui file that describes the ui
+    ui_filename = os.path.join(getdatapath(), 'ui', 'PhotobombWindow.ui')
+    if not os.path.exists(ui_filename):
+        ui_filename = None
+
+    builder = gtk.Builder()
+    builder.add_from_file(ui_filename)
+    window = builder.get_object("photobomb_window")
+    window.finish_initializing(builder)
+    return window
+
+def gdk_to_rgba(c, alpha=65535):
+  return (((c.red / 0x100) << 24) | ((c.green / 0x100) << 16) | ((c.blue / 0x100) << 8) | (alpha / 0x100))
+
+
+if __name__ == "__main__":
+    #support for command line options
+    import logging, optparse
+    parser = optparse.OptionParser(version="%prog %ver")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose", help="Show debug messages")
+    (options, args) = parser.parse_args()
+
+    #set the logging level to show debug messages
+    if options.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.debug('logging enabled')
+
+    from dbus.mainloop.glib import DBusGMainLoop
+    DBusGMainLoop(set_as_default=True)
+
+    #run the application
+    window = NewPhotobombWindow()
+    gtk.gdk.threads_init()
+    window.show()
+    gtk.main()
+

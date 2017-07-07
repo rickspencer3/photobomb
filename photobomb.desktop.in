@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Photobomb
+Comment=Photobomb application
+Categories=GNOME;Utility;
+Exec=photobomb
+Icon=/usr/share/photobomb/media/icon.png
+Terminal=false
+Type=Application

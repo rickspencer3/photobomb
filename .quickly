@@ -1,0 +1,4 @@
+project = photobomb
+template = ubuntu-application
+version = 11.04
+lp_id = photobomb
